@@ -1,15 +1,16 @@
 // Copyright (c) 2026 Radoslaw Biernacki <radoslaw.biernacki@gmail.com>
 // SPDX-License-Identifier: MIT
 //
-// provider-cost-tracer — generic HTTP request/response logger for OpenCode.
+// provider-cost-tracer — generic request/response logger for OpenCode.
 //
-// Registers the native `http.request` and `http.response` hooks (provider
-// agnostic) and writes one normalized JSON record per model request to a JSONL
-// file. Each record captures provider, model, input/output tokens, cache reuse,
-// and cost. Compatible with OpenRouter and OpenAI for now; other response
-// shapes can be added by extending `normalize`. It also registers a
-// `provider_cost_trace` tool that reads the log back so an agent (or the
-// /or-usage command) can report it.
+// Registers the native `http.request`/`http.response` hooks and the
+// experimental `experimental.ws.*` hooks, and writes one normalized JSON record
+// per model request to a JSONL file. Each record captures provider, model,
+// input/output tokens, cache reuse, and cost. HTTP providers (OpenRouter,
+// OpenAI-compatible) are observed over HTTP; OpenAI/xAI/Azure Responses are
+// observed over their per-session WebSocket via its terminal
+// `response.completed` frame. It also registers a `provider_cost_trace` tool
+// that reads the log back so an agent (or the /or-usage command) can report it.
 //
 // Log: /tmp/opencode/provider-cost-tracer/index.jsonl
 
@@ -21,6 +22,14 @@ const LOG_DIR = "/tmp/opencode/provider-cost-tracer"
 const LOG_FILE = join(LOG_DIR, "index.jsonl")
 const DEFAULT_LIMIT = 10
 
+// Opt-in verbose evidence log (`debug.jsonl`). Off during normal use.
+const DEBUG = false
+const DEBUG_LOG = join(LOG_DIR, "debug.jsonl")
+const MAX_FRAME_BYTES = 4096
+
+const truncate = (text: string): string =>
+  text.length > MAX_FRAME_BYTES ? text.slice(0, MAX_FRAME_BYTES) + `…(+${text.length - MAX_FRAME_BYTES})` : text
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value)
 }
@@ -29,26 +38,31 @@ function asNumber(value: unknown): number | null {
   return typeof value === "number" ? value : null
 }
 
-// Normalize a Chat Completions response chunk into the flat fields we report.
-// OpenRouter and OpenAI share prompt_tokens/completion_tokens and
-// prompt_tokens_details.cached_tokens; provider and cost are OpenRouter-only.
+// Normalize one response body into the flat fields we report. Chat Completions
+// (OpenRouter and openai-compatible routes) and the Responses API (direct
+// OpenAI) report tokens under different keys, so read either shape. `provider`
+// and `cost` are OpenRouter-only.
 function normalize(body: Record<string, unknown>) {
   const usage = isRecord(body.usage) ? body.usage : {}
-  const promptDetails = isRecord(usage.prompt_tokens_details) ? usage.prompt_tokens_details : {}
+  const details =
+    isRecord(usage.prompt_tokens_details) ? usage.prompt_tokens_details
+    : isRecord(usage.input_tokens_details) ? usage.input_tokens_details
+    : {}
   return {
     provider: typeof body.provider === "string" ? body.provider : null,
     model: typeof body.model === "string" ? body.model : null,
-    input_tokens: asNumber(usage.prompt_tokens),
-    output_tokens: asNumber(usage.completion_tokens),
-    cache_read_tokens: asNumber(promptDetails.cached_tokens),
-    cache_write_tokens: asNumber(promptDetails.cache_write_tokens),
+    input_tokens: asNumber(usage.prompt_tokens) ?? asNumber(usage.input_tokens),
+    output_tokens: asNumber(usage.completion_tokens) ?? asNumber(usage.output_tokens),
+    cache_read_tokens: asNumber(details.cached_tokens),
+    cache_write_tokens: asNumber(details.cache_write_tokens),
     cost: asNumber(usage.cost),
   }
 }
 
-// Extract the final object from a streamed Chat Completions response body (the
-// last SSE `data:` chunk carries the accumulated usage), falling back to
-// parsing the whole body as JSON for non-streaming responses.
+// Extract the final object from a streamed response body. Chat Completions
+// carry the accumulated `usage` in the last SSE `data:` chunk; the Responses
+// API carries it inside the final `response.completed` event's `response`
+// sub-object. Falls back to parsing the whole body as JSON for non-streaming.
 function responseObject(text: string): Record<string, unknown> {
   let last: Record<string, unknown> = {}
   let sawData = false
@@ -65,7 +79,15 @@ function responseObject(text: string): Record<string, unknown> {
       // ignore malformed chunk
     }
   }
-  if (sawData) return last
+  if (sawData) {
+    // The Responses API stream ends with a `response.completed` event whose
+    // `response` sub-object carries the accumulated `usage`; Chat Completions
+    // streams flat chunks instead. Unwrap the former so both reach `normalize`
+    // as the same flat shape.
+    return last.type === "response.completed" && isRecord(last.response)
+      ? last.response
+      : last
+  }
   try {
     const parsed = JSON.parse(text)
     if (isRecord(parsed)) return parsed
@@ -108,8 +130,35 @@ export default {
 
     const write = (record: Record<string, unknown>): Promise<void> => appendFile(LOG_FILE, JSON.stringify(record) + "\n")
 
+    const debug = (record: Record<string, unknown>): Promise<void> =>
+      DEBUG ? appendFile(DEBUG_LOG, JSON.stringify(record) + "\n") : Promise.resolve()
+
+    const summarizeModel = (value: unknown): Record<string, unknown> | null => {
+      if (!isRecord(value)) return null
+      return {
+        providerID: typeof value.providerID === "string" ? value.providerID : null,
+        id: typeof value.id === "string" ? value.id : null,
+        variant: typeof value.variant === "string" ? value.variant : null,
+        keys: Object.keys(value),
+      }
+    }
+
     await ctx.session.hook("http.request", async (event) => {
       const model = readModel(event)
+      if (DEBUG) {
+        await debug({
+          hook: "http.request",
+          ts: new Date().toISOString(),
+          sessionID: event.sessionID ?? null,
+          agent: event.agent ?? null,
+          kind: event.kind ?? null,
+          model: summarizeModel(event.model),
+          providerID: model?.providerID ?? null,
+          modelID: model?.id ?? null,
+          url: typeof event.request?.url === "string" ? event.request.url : null,
+          eventKeys: Object.keys(event),
+        })
+      }
       if (!model) return
       const body = await event.request.clone().text()
       pending.set(hashBody(body), {
@@ -126,6 +175,17 @@ export default {
 
     await ctx.session.hook("http.response", async (event) => {
       const started = Date.now()
+      if (DEBUG) {
+        await debug({
+          hook: "http.response",
+          ts: new Date().toISOString(),
+          sessionID: event.sessionID ?? null,
+          kind: event.kind ?? null,
+          model: summarizeModel(event.model),
+          url: typeof event.request?.url === "string" ? event.request.url : null,
+          status: event.response?.status ?? null,
+        })
+      }
       const requestBody = await event.request.clone().text()
       const key = hashBody(requestBody)
       const req = pending.get(key)
@@ -170,6 +230,111 @@ export default {
       } catch (error) {
         await writeRecord({}, error instanceof Error ? error.message : String(error))
       }
+    })
+
+    // WebSocket capture. OpenAI (ChatGPT/Codex), xAI, and some Azure Responses
+    // models stream over a per-session WebSocket that the `http.request` /
+    // `http.response` hooks never observe. Capture the terminal
+    // `response.completed` frame and emit the same normalized record the HTTP
+    // path does, so the transport stays on WebSocket.
+    const registerWsHook = async (name: string, callback: (event: any) => Promise<void>) => {
+      try {
+        await ctx.session.hook(name, callback)
+      } catch (error) {
+        await debug({
+          hook: name,
+          ts: new Date().toISOString(),
+          registrationError: error instanceof Error ? error.message : String(error),
+        })
+      }
+    }
+
+    // sessionID -> WebSocket endpoint URL, captured at handshake and reused to
+    // annotate each completed turn's record.
+    const wsSessions = new Map<string, string | undefined>()
+
+    await registerWsHook("experimental.ws.handshake", async (event) => {
+      if (typeof event.sessionID === "string") {
+        wsSessions.set(event.sessionID, typeof event.url === "string" ? event.url : undefined)
+      }
+      await debug({
+        hook: "ws.handshake",
+        ts: new Date().toISOString(),
+        sessionID: event.sessionID ?? null,
+        agent: event.agent ?? null,
+        kind: event.kind ?? null,
+        model: summarizeModel(event.model),
+        url: typeof event.url === "string" ? event.url : null,
+        headerKeys: isRecord(event.headers) ? Object.keys(event.headers) : null,
+        eventKeys: Object.keys(event),
+      })
+    })
+
+    await registerWsHook("experimental.ws.send", async (event) => {
+      const frame = typeof event.frame === "string" ? event.frame : JSON.stringify(event.frame ?? null)
+      await debug({
+        hook: "ws.send",
+        ts: new Date().toISOString(),
+        sessionID: event.sessionID ?? null,
+        kind: event.kind ?? null,
+        model: summarizeModel(event.model),
+        eventKeys: Object.keys(event),
+        frame: truncate(frame),
+      })
+    })
+
+    await registerWsHook("experimental.ws.receive", async (event) => {
+      const raw = typeof event.frame === "string" ? event.frame : JSON.stringify(event.frame ?? null)
+      let parsed: Record<string, unknown> | null = null
+      try {
+        const obj = JSON.parse(raw)
+        parsed = isRecord(obj) ? obj : null
+      } catch {
+        // truncated or non-JSON frame
+      }
+      const base = {
+        hook: "ws.receive",
+        ts: new Date().toISOString(),
+        sessionID: event.sessionID ?? null,
+        kind: event.kind ?? null,
+        model: summarizeModel(event.model),
+        frameType: parsed !== null && typeof parsed.type === "string" ? parsed.type : null,
+      }
+      if (parsed === null) {
+        await debug({ ...base, raw: truncate(raw) })
+        return
+      }
+      const resp = isRecord(parsed.response) ? parsed.response : {}
+      await debug({
+        ...base,
+        keys: Object.keys(parsed),
+        responseKeys: isRecord(parsed.response) ? Object.keys(parsed.response) : null,
+        responseId: typeof resp.id === "string" ? resp.id : null,
+        responseStatus: typeof resp.status === "string" ? resp.status : null,
+        responseModel: typeof resp.model === "string" ? resp.model : null,
+        usage: isRecord(resp.usage) ? resp.usage : null,
+        timing: parsed.type === "responsesapi.websocket_timing" ? parsed : null,
+      })
+
+      if (parsed.type !== "response.completed") return
+      const model = readModel(event)
+      const created = asNumber(resp.created_at)
+      const completed = asNumber(resp.completed_at)
+      await write({
+        ts: new Date().toISOString(),
+        sessionID: event.sessionID ?? null,
+        agent: event.agent ?? null,
+        kind: event.kind ?? null,
+        providerID: model?.providerID ?? null,
+        model: model?.id ?? (typeof resp.model === "string" ? resp.model : null),
+        request: {
+          url: typeof event.sessionID === "string" ? (wsSessions.get(event.sessionID) ?? null) : null,
+          bodyLength: null,
+        },
+        response: { status: resp.status === "completed" ? 200 : null, ...normalize(resp) },
+        elapsedMs: created !== null && completed !== null ? (completed - created) * 1000 : null,
+        error: null,
+      })
     })
 
     const readRecords = async (limit: number): Promise<string> => {
