@@ -1,0 +1,44 @@
+{
+  "model": {
+    "*": {
+      "provider": {
+        "sort": "throughput"
+      }
+    },
+    "deepseek/*": {
+      "max_tokens": 16383,
+      "provider": {
+        "sort": "throughput",
+        "quantizations": ["unknown", "fp8"]
+      }
+    },
+    "deepseek/deepseek-v4-pro-0813*": {
+      "provider": {
+        "only": [
+          "deepseek",
+          "streamlake",
+          "deepinfra/fp8"
+        ],
+        "allow_fallbacks": false
+      }
+    },
+    "deepseek/deepseek-v4.1-flash*": {
+      "provider": {
+        "preferred_min_throughput": { "p75": 100 },
+        "only": [
+          "deepinfra",
+          "streamlake",
+          "relace",
+          "deepseek",
+          "coreweave",
+          "inference-net",
+          "digitalocean",
+          "baidu",
+          "gmicloud",
+          "atlas-cloud"
+        ],
+        "allow_fallbacks": false
+      }
+    }
+  }
+}

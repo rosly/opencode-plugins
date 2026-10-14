@@ -68,7 +68,7 @@ The config file is a JSON object with a single top-level `model` map. Each key i
   "model": {
     "*":                 { /* baseline overrides */ },
     "openai/*":          { /* all OpenAI-hosted models */ },
-    "openai/gpt-5, openai/gpt-5-mini": { /* two models share one set */ },
+    "openai/gpt-5*, openai/gpt-5-mini*": { /* two models share one set */ },
     "anthropic/claude-sonnet-4-5#high": { /* a single model variant */ }
   }
 }
@@ -80,12 +80,12 @@ A key is one pattern, a comma-separated list of patterns, or a literal slug. All
 
 - **Prefix wildcard** — `anthropic/*` matches every Anthropic-hosted model.
 - **Full glob** — `*` and `?` anywhere, e.g. `anthropic/claude-?-5*`.
-- **Comma-separated list** — `"openai/gpt-5, openai/gpt-5-mini"`. Order within a list is irrelevant; if any pattern matches, the entry applies once.
+- **Comma-separated list** — `"openai/gpt-5*, openai/gpt-5-mini*"`. Order within a list is irrelevant; if any pattern matches, the entry applies once.
 - **Literal slug** — including an explicit variant, e.g. `openai/gpt-5#high`.
 
 ### Matching and precedence
 
-- The match target is the full slug including variant: `id#variant` (for example `openai/gpt-5#high`). A key that names a variant matches **only that variant**; a base-id key matches only base-id requests.
+- The match target is the full slug including variant: `id#variant`. OpenCode always supplies a variant — `default` when none is selected — so a base model's slug is always `id#default`, never the bare `id`. A key that is a bare base id (for example `openai/gpt-5`) therefore matches **nothing**. Append `*` to match the model across all variants: `openai/gpt-5*`. A key that names a specific variant (for example `openai/gpt-5#high`) matches **only that variant**.
 - Entries are processed **top-to-bottom** in file order. Every entry whose key matches contributes its override set, **deep-merged** over the accumulated result. A later match overwrites an earlier one per-key.
 - `"*"` has no special precedence — it is an ordinary entry. Place it first for a baseline, or last as an "always apply" fallback.
 
@@ -127,6 +127,117 @@ Each override set maps to OpenRouter's Chat Completions request body. `provider`
 
 See the OpenRouter provider-routing guide for full semantics: <https://openrouter.ai/docs/features/provider-routing>.
 
+### Routing and price gotchas
+
+`sort: "price"` does **not** mean "cheapest output tokens." OpenRouter decides the route *before* it generates anything, so the completion length is unknown at routing time. The only cost it can compute up front is the **input** side (prompt tokens, plus cache-read tokens where they apply). In practice `sort: "price"` therefore ranks endpoints by their **input price** (`prompt` rate), not their output price.
+
+This matters because suppliers deliberately set a very low `prompt` price to win `sort: "price"` routing, while charging the highest `completion` price in the pool. Workloads that are prompt-heavy (short generations, large shared context, heavy tool calls) are genuinely served cheapest by those suppliers; workloads that are output-heavy are *not*, and the "cheapest" route will still bill you the highest output rate.
+
+**Our worked example** (`deepseek/deepseek-v4-pro-0813`), taken from the live endpoints API. Endpoint `prompt` vs `completion` rates, USD per 1M tokens:
+
+| Endpoint | prompt $/M | completion $/M |
+| - | - | - |
+| Wafer | **0.25** (cheapest input) | **5.00** (highest output) |
+| DeepSeek | 0.66 | 1.98 |
+| StreamLake | 0.66 | 1.98 |
+| Sail Research (fp4) | 0.48 | 1.98 |
+
+A clean ~8.7k-token prompt with a ~60-token reply costs `8707×prompt + 60×completion`. For Wafer that is `8707×0.25e-6 + 60×5.00e-6 ≈ $0.0025`, for DeepSeek `8707×0.66e-6 + 60×1.98e-6 ≈ $0.0059`. Because the prompt dominates, **Wafer really is the cheapest route** — and `sort: "price"` correctly sends the request there. The "$1.98 DeepSeek vs $5 Wafer" comparison is only valid for completion *tokens*, which are a small share of this request.
+
+The consequence for configuration:
+
+- **For prompt-heavy traffic**, `sort: "price"` works as intended; add `max_price.completion` as a ceiling if you want to cap the output rate while still routing cheaply up front.
+- **For output-heavy traffic**, `sort: "price"` cannot pick a low output rate. Use `max_price.completion` to *exclude* high-output endpoints (unlike the soft `preferred_*` thresholds, `max_price` prevents the request from running when no endpoint qualifies), or pin providers explicitly with `only` / `order`.
+
+There is no `sort` value for output price; the closest control is a hard ceiling, e.g.:
+
+```jsonc
+"deepseek/deepseek-v4-pro-0813*": {
+  "provider": {
+    "sort": "price",
+    "max_price": { "completion": "1.98", "prompt": "0.66" }
+  }
+}
+```
+
+### Where the real prices live
+
+The OpenRouter **model page does not show the per-endpoint price breakdown** it uses for routing. It renders a single headline price and throughput/latency percentiles; the actual decision data (per-endpoint `prompt`, `completion`, `input_cache_read`, and time-of-week `overrides`) is behind an API endpoint. The model page also does not reveal the time-tiered `overrides` that many official endpoints carry (see below), so its displayed number is frequently not the price your request is quoted.
+
+Fetch the authoritative per-endpoint prices with:
+
+```bash
+curl https://openrouter.ai/api/v1/models/MODEL_ID/endpoints
+```
+
+For this example:
+
+```bash
+curl https://openrouter.ai/api/v1/models/deepseek/deepseek-v4-pro-0813/endpoints
+```
+
+The response lists one entry per endpoint with `pricing` (`prompt`, `completion`, `input_cache_read`, `discount`) and a nested `overrides` array. Proof — the `DeepSeek` endpoint's completion price is **time-tiered**, not the flat $1.98 the page implies:
+
+```json
+{
+  "provider_name": "DeepSeek",
+  "quantization": "unknown",
+  "pricing": {
+    "prompt": "0.00000066",
+    "completion": "0.00000198",
+    "input_cache_read": "0.000000022",
+    "overrides": [
+      { "utc_days": ["saturday", "sunday"], "completion": "0.00000198" },
+      { "utc_start": 0,   "utc_end": 100,  "utc_days": ["monday", "tuesday", "wednesday", "thursday", "friday"], "completion": "0.00000198" },
+      { "utc_start": 100, "utc_end": 400,  "utc_days": ["monday", "tuesday", "wednesday", "thursday", "friday"], "completion": "0.00000396" },
+      { "utc_start": 400, "utc_end": 600,  "utc_days": ["monday", "tuesday", "wednesday", "thursday", "friday"], "completion": "0.00000198" },
+      { "utc_start": 600, "utc_end": 1000, "utc_days": ["monday", "tuesday", "wednesday", "thursday", "friday"], "completion": "0.00000396" },
+      { "utc_start": 1000, "utc_end": 0,   "utc_days": ["monday", "tuesday", "wednesday", "thursday", "friday"], "completion": "0.00000198" }
+    ]
+  }
+}
+```
+
+`utc_start`/`utc_end` are tenths-of-an-hour into the day, so the `$3.96` completion rate applies during weekday peak hours and `$1.98` off-peak and on weekends. All prices are **per token**; multiply by 1,000,000 for the per-million rate. The `quantization` field is what your `quantizations` routing filter matches against — note the official DeepSeek endpoint reports `"unknown"`, and the cheap `fp4` endpoints (e.g. Sail Research) are a distinct tag your filter may be excluding.
+
+### Choosing providers: a worked process
+
+Here is the end-to-end process we used to pick the cheapest and fastest suppliers for `deepseek/deepseek-v4.1-flash`, and how it defeats the input-price trick described above.
+
+**Step 1 — pull the endpoint data and rank by output price.** The endpoints API is the source of truth for `prompt`/`completion`/`input_cache_read` rates per supplier, so we query it and sort by the `completion` (output) price we actually care about, not the `prompt` (input) price that `sort: "price"` would rank on:
+
+```bash
+curl https://openrouter.ai/api/v1/models/deepseek/deepseek-v4.1-flash/endpoints
+```
+
+**Step 2 — filter to a quantization tag and note the provider slugs.** We keep only `quantization: "fp8"` / `"unknown"` entries, then record the `tag` slug of each supplier we want to allow. The `tag` field carries the routing slug (e.g. `streamlake/fp8`, `coreweave/fp8`, `inference-net/fp8`); the base slug before the `/` is what goes into `only`. The cheap-output endpoints ranked this way for flash were:
+
+```text
+deepinfra, streamlake, relace, deepseek, coreweave,
+inference-net, digitalocean, baidu, gmicloud, atlas-cloud
+```
+
+Listing these slugs in `only` is the step that overcomes the trick — a supplier that wins `sort: "price"` on a low input price (and hides a high output price) never enters the pool, because the pool is fixed by `only` from the output-price ranking we computed ourselves.
+
+**Step 3 — rank by throughput and gate on a TPS floor.** With the supplier set fixed, we stop caring about price entirely and sort by speed, plus a minimum quality-of-service floor on throughput:
+
+```jsonc
+"deepseek/deepseek-v4.1-flash*": {
+  "provider": {
+    "preferred_min_throughput": { "p75": 100 },
+    "only": [
+      "deepinfra", "streamlake", "relace", "deepseek", "coreweave",
+      "inference-net", "digitalocean", "baidu", "gmicloud", "atlas-cloud"
+    ],
+    "allow_fallbacks": false
+  }
+}
+```
+
+`sort` is deliberately omitted here — it is inherited from a shared baseline entry (`"*": { "provider": { "sort": "throughput" } }`) that sorts every request by throughput, so per-model entries only need to add their `only` set, the `preferred_min_throughput: { "p75": 100 }` floor, and `allow_fallbacks: false`.
+
+The general recipe is therefore: **query the endpoints API → rank by output price → pin the winners with `only` → apply `sort` (`price` for output-heavy, `throughput`/`latency` for speed) → gate quality with `preferred_min_throughput`/`preferred_max_latency` → `allow_fallbacks: false` to keep the boundary hard.**
+
 ### Full example
 
 A copy-able version of this example is at `config/openrouter-params-example.json`:
@@ -156,7 +267,7 @@ A copy-able version of this example is at `config/openrouter-params-example.json
     },
 
     // One override shared by several models via a comma-separated key.
-    "openai/gpt-5, openai/gpt-5-mini": {
+    "openai/gpt-5*, openai/gpt-5-mini*": {
       "provider": {
         "sort": "throughput"                    // override `sort`; keeps the rest of `provider`
       },
@@ -184,7 +295,7 @@ A copy-able version of this example is at `config/openrouter-params-example.json
 Cross-model routing with `partition: "none"` combines a `models` fallback chain with a `provider.sort` across all candidate models:
 
 ```jsonc
-"openai/gpt-5": {
+"openai/gpt-5*": {
   "models": [ "openai/gpt-5", "google/gemini-3.1-pro" ],
   "provider": { "sort": { "by": "throughput", "partition": "none" } }
 }

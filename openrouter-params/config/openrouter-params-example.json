@@ -24,7 +24,7 @@
         "sort": "throughput"
       }
     },
-    "openai/gpt-5, openai/gpt-5-mini": {
+    "openai/gpt-5*, openai/gpt-5-mini*": {
       "provider": {
         "sort": "throughput"
       },
